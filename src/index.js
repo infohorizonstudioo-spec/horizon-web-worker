@@ -10,18 +10,19 @@ const CHAT = process.env.OWNER_TELEGRAM_CHAT_ID;
 const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID;
 const POLL_MS = parseInt(process.env.POLLING_INTERVAL_MS || "6000");
-const MY_ROLES = ["frontend"];
+const MY_ROLES = ["frontend", "worker"];
 const MY_TYPES = ["web_generate", "web_deploy"];
 
 function log(msg) { console.log(`[${new Date().toISOString().slice(11,19)}] [WEB] ${msg}`); }
 
-async function tg(text) {
-  if (!BOT || !CHAT) return;
+async function tg(text, chatId) {
+  const target = chatId || CHAT;
+  if (!BOT || !target) return;
   try {
     await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: CHAT, text: text.slice(0, 4096), parse_mode: "Markdown" }),
+      body: JSON.stringify({ chat_id: target, text: text.slice(0, 4096) }),
     });
   } catch {}
 }
@@ -87,7 +88,7 @@ async function claimTask() {
       .eq("status", "pending").order("sequence_order", { ascending: true }).limit(20);
     if (!tasks?.length) return null;
     for (const task of tasks) {
-      const execType = task.input_json?.execution_type || "";
+      const execType = task.input_json?.execution_type || task.input_json?.task_type || task.task_type || "";
       const isWebTask = MY_TYPES.some(t => execType.includes(t)) || MY_ROLES.includes(task.agent_role);
       if (!isWebTask) continue;
       if (task.depends_on?.length) {
@@ -121,6 +122,7 @@ async function completeTask(taskId, woId, success, summary, url, error) {
 async function processTask() {
   const task = await claimTask();
   if (!task) return false;
+  const chatId = task.input_json?.chat_id || task.input_json?.telegram_chat_id || CHAT;
   log(`Procesando: ${task.title}`);
   try {
     const config = task.input_json?.config || {};
@@ -130,25 +132,24 @@ async function processTask() {
 
     if (!CF_TOKEN || !CF_ACCOUNT) {
       await completeTask(task.id, task.work_order_id, true, `Código generado (${html.length} chars). Configura CLOUDFLARE_API_TOKEN y CLOUDFLARE_ACCOUNT_ID.`, null, null);
-      await tg(`✅ *${task.title}*\n\nEl código de la web está listo pero falta configurar Cloudflare.`);
+      await tg(`El código de la web está listo pero falta configurar Cloudflare.`, chatId);
       return true;
     }
 
     const url = await deployToCloudflare(projectName, html);
     log(`Publicado: ${url}`);
     await completeTask(task.id, task.work_order_id, true, `Publicada en ${url}`, url, null);
-    await tg(`🌐 *${task.title}*\n\nListo, ya está publicada:\n${url}\n\n_Optimizada para SEO y mobile._`);
+    await tg(`Ya está publicada:\n${url}`, chatId);
 
     const { data: pending } = await supabase.from("agent_tasks").select("id")
       .eq("work_order_id", task.work_order_id).not("status", "in", '("done","skipped","failed")');
     if (!pending?.length) {
       await supabase.from("work_orders").update({ status: "completed", updated_at: new Date().toISOString() }).eq("id", task.work_order_id);
-      await tg(`🎉 *Todo listo.*`);
     }
   } catch (err) {
     log("Error: " + err.message);
     await completeTask(task.id, task.work_order_id, false, null, null, err.message);
-    await tg(`⚠️ *${task.title}*\n\nAlgo falló generando la web. Inténtalo de nuevo.`);
+    await tg(`Algo falló generando la web: ${err.message.slice(0, 100)}`, chatId);
   }
   return true;
 }
