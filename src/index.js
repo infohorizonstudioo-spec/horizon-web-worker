@@ -117,9 +117,11 @@ async function claimTask() {
 }
 
 async function completeTask(taskId, woId, success, summary, url, error) {
+  // summary nunca debe contener HTML — solo la URL o texto corto
+  const safeSummary = url ? `Publicada en ${url}` : (summary || "").slice(0, 200).replace(/<[^>]*>/g, "");
   await supabase.from("agent_tasks").update({
     status: success ? "done" : "failed",
-    output_json: { summary, url, worker: "web-worker" },
+    output_json: { summary: safeSummary, url, worker: "web-worker" },
     error_message: error, completed_at: new Date().toISOString()
   }).eq("id", taskId);
   await supabase.from("agent_events").insert({
