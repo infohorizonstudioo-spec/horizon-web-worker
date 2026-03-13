@@ -1,4 +1,5 @@
 import "dotenv/config";
+import crypto from "crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 
@@ -6,7 +7,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const BOT = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT = process.env.OWNER_TELEGRAM_CHAT_ID;
-const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
+const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID;
 const POLL_MS = parseInt(process.env.POLLING_INTERVAL_MS || "6000");
 const MY_ROLES = ["frontend"];
 const MY_TYPES = ["web_generate", "web_deploy"];
@@ -24,30 +26,41 @@ async function tg(text) {
   } catch {}
 }
 
-async function deployToVercel(projectName, html) {
-  const res = await fetch("https://api.vercel.com/v13/deployments", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${VERCEL_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: projectName,
-      files: [{ file: "index.html", data: Buffer.from(html).toString("base64"), encoding: "base64" }],
-      projectSettings: { framework: null, buildCommand: null, outputDirectory: null },
-      target: "production"
-    })
-  });
+async function ensurePagesProject(projectName) {
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects`,
+    {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${CF_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: projectName, production_branch: "main" })
+    }
+  );
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error?.message || JSON.stringify(data).slice(0, 100));
-  const deployId = data.id;
-  for (let i = 0; i < 15; i++) {
-    await new Promise(r => setTimeout(r, 4000));
-    const check = await fetch(`https://api.vercel.com/v13/deployments/${deployId}`, {
-      headers: { "Authorization": `Bearer ${VERCEL_TOKEN}` }
-    });
-    const s = await check.json();
-    if (s.readyState === "READY") return `https://${s.url}`;
-    if (s.readyState === "ERROR") throw new Error("Vercel build failed");
+  // Si ya existe (error 8000007) lo ignoramos
+  if (!res.ok && !JSON.stringify(data).includes("8000007") && !JSON.stringify(data).includes("already exists")) {
+    log(`ensureProject warn: ${JSON.stringify(data).slice(0, 150)}`);
   }
-  return `https://${data.url}`;
+}
+
+async function deployToCloudflare(projectName, html) {
+  await ensurePagesProject(projectName);
+
+  // Hash MD5 del contenido
+  const hash = crypto.createHash("md5").update(html).digest("hex");
+
+  // FormData con manifest + archivo
+  const formData = new FormData();
+  formData.append("manifest", JSON.stringify({ "/index.html": hash }));
+  formData.append(`files[${hash}]`, new Blob([html], { type: "text/html" }), "index.html");
+
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects/${projectName}/deployments`,
+    { method: "POST", headers: { "Authorization": `Bearer ${CF_TOKEN}` }, body: formData }
+  );
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.errors?.[0]?.message || JSON.stringify(data).slice(0, 200));
+
+  return `https://${projectName}.pages.dev`;
 }
 
 async function generateWebsite(task) {
@@ -115,13 +128,13 @@ async function processTask() {
     const html = await generateWebsite(task);
     log(`HTML generado: ${html.length} chars`);
 
-    if (!VERCEL_TOKEN || VERCEL_TOKEN === "PENDIENTE") {
-      await completeTask(task.id, task.work_order_id, true, `Código generado (${html.length} chars). Configura VERCEL_TOKEN para publicar.`, null, null);
-      await tg(`✅ *${task.title}*\n\nEl código de la web está listo. En cuanto configures Vercel lo publico automáticamente.`);
+    if (!CF_TOKEN || !CF_ACCOUNT) {
+      await completeTask(task.id, task.work_order_id, true, `Código generado (${html.length} chars). Configura CLOUDFLARE_API_TOKEN y CLOUDFLARE_ACCOUNT_ID.`, null, null);
+      await tg(`✅ *${task.title}*\n\nEl código de la web está listo pero falta configurar Cloudflare.`);
       return true;
     }
 
-    const url = await deployToVercel(projectName, html);
+    const url = await deployToCloudflare(projectName, html);
     log(`Publicado: ${url}`);
     await completeTask(task.id, task.work_order_id, true, `Publicada en ${url}`, url, null);
     await tg(`🌐 *${task.title}*\n\nListo, ya está publicada:\n${url}\n\n_Optimizada para SEO y mobile._`);
