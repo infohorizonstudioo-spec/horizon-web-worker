@@ -68,13 +68,25 @@ async function generateWebsite(task) {
   const msg = await anthropic.messages.create({
     model: "claude-sonnet-4-20250514", max_tokens: 8192,
     messages: [{ role: "user", content:
-      `Eres experto en diseño web y SEO. Genera un sitio web completo y profesional.\n\n` +
+      `Eres un diseñador web experto. Crea una landing page PROFESIONAL y COMPLETA.\n\n` +
       `BRIEFING:\n${task.input_prompt}\n\n` +
-      `REGLAS:\n- Todo en un único index.html (HTML+CSS+JS embebido)\n` +
-      `- Responsive, mobile-first, diseño moderno y atractivo\n` +
-      `- SEO completo: meta tags, Open Graph, Schema.org\n` +
-      `- Si hay fotos, usa las URLs directamente\n` +
-      `- Devuelve SOLO el HTML, empieza con <!DOCTYPE html>`
+      `REQUISITOS OBLIGATORIOS:\n` +
+      `- Todo en un único index.html con CSS y JS embebidos\n` +
+      `- Diseño MODERNO y PREMIUM — no básico, no genérico\n` +
+      `- 100% responsive y mobile-first con media queries reales\n` +
+      `- Usa Google Fonts (importa desde fonts.googleapis.com)\n` +
+      `- Usa imágenes reales de Unsplash (https://images.unsplash.com/photo-XXXXX?w=1200&q=80)\n` +
+      `- Paleta de colores coherente y profesional, con variables CSS\n` +
+      `- Animaciones suaves: fade-in al scroll con IntersectionObserver\n` +
+      `- Navegación fija con scroll suave entre secciones\n` +
+      `- Hero section impactante con imagen de fondo y overlay\n` +
+      `- Secciones bien definidas con padding generoso\n` +
+      `- Botones CTA con hover effects\n` +
+      `- Footer completo con info de contacto\n` +
+      `- SEO: title, description, Open Graph, Schema.org\n` +
+      `- El formulario de contacto debe tener estilos completos\n` +
+      `- NUNCA uses Bootstrap ni frameworks externos — CSS propio\n\n` +
+      `Devuelve SOLO el HTML completo empezando con <!DOCTYPE html>. Sin explicaciones.`
     }]
   });
   const html = msg.content.filter(b => b.type === "text").map(b => b.text).join("").trim();
