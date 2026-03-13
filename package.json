@@ -1,0 +1,13 @@
+{
+  "name": "horizon-web-worker",
+  "version": "1.0.0",
+  "description": "Horizon Web Worker — genera y publica páginas web",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": { "start": "node src/index.js" },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "dotenv": "^16.4.7"
+  }
+}
