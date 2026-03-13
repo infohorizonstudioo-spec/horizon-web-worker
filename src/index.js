@@ -61,7 +61,9 @@ async function deployToCloudflare(projectName, html) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.errors?.[0]?.message || JSON.stringify(data).slice(0, 200));
 
-  return `https://${projectName}.pages.dev`;
+  // Usar URL del deployment directo — la URL del proyecto tarda minutos en activarse
+  const deployUrl = data.result?.url || `https://${projectName}.pages.dev`;
+  return deployUrl;
 }
 
 async function generateWebsite(task) {
