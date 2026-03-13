@@ -153,10 +153,10 @@ async function processTask() {
     }
 
     const url = await deployToCloudflare(projectName, html);
+    if (!url || !url.startsWith("http")) throw new Error("Deploy fallido, URL invalida: "+String(url).slice(0,50));
     log(`Publicado: ${url}`);
     await completeTask(task.id, task.work_order_id, true, `Publicada en ${url}`, url, null);
-    if (!url) throw new Error("URL vacia tras deploy");
-    await tg(`Listo. Aqui tienes la web:\n\n${url}`, chatId);
+    await tg(`Aqui tienes la web:\n\n${url}`, chatId);
 
     const { data: pending } = await supabase.from("agent_tasks").select("id")
       .eq("work_order_id", task.work_order_id).not("status", "in", '("done","skipped","failed")');
