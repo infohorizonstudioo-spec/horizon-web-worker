@@ -2,7 +2,7 @@ import "dotenv/config";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { execSync } from "child_process";
-import { mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync, existsSync } from "fs";
 import { join, relative } from "path";
 import crypto from "crypto";
 import os from "os";
@@ -14,8 +14,16 @@ const CHAT = process.env.OWNER_TELEGRAM_CHAT_ID;
 const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID;
 const POLL_MS = parseInt(process.env.POLLING_INTERVAL_MS || "8000");
-const MY_TYPES = ["web_generate", "web_deploy"];
-const MY_ROLES = ["frontend", "worker"];
+const SITES_DIR = process.env.SITES_DIR || join(os.tmpdir(), "generated-sites");
+
+// Task types this worker handles
+const HANDLED_TYPES = [
+  "web_generate", "web_deploy",
+  "assemble_nextjs_project", "deploy_preview", "notify_telegram",
+  "collect_website_assets", "generate_website_brief",
+  "generate_website_structure", "generate_homepage_copy",
+  "generate_seo_metadata", "process_images"
+];
 
 function log(msg) { console.log(`[${new Date().toISOString().slice(11,19)}] [WEB] ${msg}`); }
 
@@ -30,189 +38,326 @@ async function tg(text, chatId) {
   } catch {}
 }
 
-// Genera los archivos del proyecto Next.js usando Claude
-async function generateNextJsProject(task) {
-  const brief = task.input_prompt || task.input_json?.prompt || "Crea una web profesional";
-  log("Generando componentes Next.js con Sonnet...");
+// ── PHASE 3: Generate real Next.js project files ──────────────────────────
 
-  const msg = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 8192,
-    messages: [{ role: "user", content: `Eres un experto en Next.js 14 y Tailwind CSS. Genera los archivos de un proyecto web completo y profesional.
+async function generateNextJsFiles(brief, photoUrls, projectSlug) {
+  const photos = (photoUrls || []).filter(Boolean);
+  const photoSection = photos.length > 0
+    ? `\nFOTOS REALES DEL CLIENTE (usa estas URLs directamente en los img src):\n${photos.map((u,i) => `Foto ${i+1}: ${u}`).join("\n")}`
+    : "\nSin fotos — usa imagenes de Unsplash con URLs directas (photo-XXXX?w=1200&q=80).";
+
+  const prompt = `Eres un experto en Next.js 14 y Tailwind CSS. Crea una landing page profesional completa.
 
 BRIEFING:
 ${brief}
+${photoSection}
 
-REGLAS:
-- Usa Next.js 14 App Router
+REGLAS ESTRICTAS:
+- Todo el codigo de la pagina en app/page.tsx (un solo archivo)
+- Empieza con "use client";
+- NO importes componentes externos (todo inline en page.tsx)
+- NO uses next/image — usa <img> normal con URLs directas
 - Tailwind CSS para todos los estilos
-- Componentes reutilizables en /components
-- Diseño moderno, premium, mobile-first
-- Fotos reales de Unsplash directamente en los src
-- Google Fonts via next/font
-- SEO completo con metadata en layout.tsx
-- Sin TypeScript errors (usa tipos correctos)
-- Sin dependencias externas salvo las incluidas en el package.json base
+- Diseño moderno, premium, responsive, mobile-first
+- Animaciones suaves con CSS transitions
+- Secciones: hero, servicios/caracteristicas, galeria (si hay fotos), contacto, footer
+- Incluye numero de telefono y email en el contacto si estan en el briefing
+- SEO: export const metadata con title y description
 
-Devuelve SOLO un JSON con esta estructura exacta (sin markdown, sin texto extra):
+DEVUELVE SOLO JSON VALIDO (sin markdown, sin texto antes/despues):
 {
-  "page_title": "titulo",
+  "project_title": "titulo corto",
+  "description": "descripcion 1 frase",
   "files": {
-    "app/page.tsx": "contenido completo del archivo",
-    "app/layout.tsx": "contenido completo del archivo",
-    "components/Hero.tsx": "contenido completo",
-    "components/Features.tsx": "contenido completo",
-    "components/Contact.tsx": "contenido completo",
-    "components/Footer.tsx": "contenido completo"
+    "app/page.tsx": "CODIGO TSX COMPLETO",
+    "app/layout.tsx": "LAYOUT COMPLETO"
   }
-}` }]
+}`;
+
+  log("Llamando a Claude Sonnet para generar Next.js...");
+  const msg = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 8192,
+    messages: [{ role: "user", content: prompt }]
   });
 
-  const raw = (msg.content[0]?.text || "").trim()
+  const raw = (msg.content[0]?.text || "")
     .replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
   const i = raw.indexOf("{"); const e = raw.lastIndexOf("}");
-  if (i === -1) throw new Error("Claude no devolvio JSON valido");
+  if (i === -1) throw new Error("Claude no devolvio JSON: " + raw.slice(0, 200));
   return JSON.parse(raw.slice(i, e + 1));
 }
 
-// Construye el proyecto Next.js y devuelve el directorio out/
-async function buildNextProject(projectFiles, projectName) {
-  const tmpDir = join(os.tmpdir(), "horizon-" + projectName);
-  try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-  mkdirSync(tmpDir, { recursive: true });
-  log(`Build dir: ${tmpDir}`);
+function writeProjectFiles(projectSlug, generatedFiles) {
+  const projectDir = join(SITES_DIR, projectSlug);
+  mkdirSync(join(projectDir, "app"), { recursive: true });
+  mkdirSync(join(projectDir, "public"), { recursive: true });
+  mkdirSync(join(projectDir, "components"), { recursive: true });
 
-  // package.json base
-  writeFileSync(join(tmpDir, "package.json"), JSON.stringify({
-    name: projectName, version: "1.0.0", private: true,
-    scripts: { build: "next build", dev: "next dev" },
+  // Archivos de configuracion base
+  writeFileSync(join(projectDir, "package.json"), JSON.stringify({
+    name: projectSlug, version: "1.0.0", private: true,
+    scripts: { build: "next build", dev: "next dev", start: "next start" },
     dependencies: {
-      next: "14.2.3", react: "^18", "react-dom": "^18"
-    },
-    devDependencies: {
+      next: "14.2.3", react: "^18", "react-dom": "^18",
       tailwindcss: "^3.4", autoprefixer: "^10", postcss: "^8",
-      "@types/node": "^20", "@types/react": "^18", "@types/react-dom": "^18",
-      typescript: "^5"
+      "@types/node": "^20", "@types/react": "^18", "@types/react-dom": "^18", typescript: "^5"
     }
   }, null, 2));
 
-  // next.config.js — output: export para subir a Cloudflare Pages
-  writeFileSync(join(tmpDir, "next.config.js"), `/** @type {import('next').NextConfig} */
-const nextConfig = { output: 'export', images: { unoptimized: true }, trailingSlash: true };
-module.exports = nextConfig;`);
+  writeFileSync(join(projectDir, "next.config.js"),
+    "const c={output:'export',images:{unoptimized:true},trailingSlash:true};module.exports=c;");
 
-  // tailwind.config.js
-  writeFileSync(join(tmpDir, "tailwind.config.js"), `/** @type {import('tailwindcss').Config} */
-module.exports = { content: ['./app/**/*.{js,ts,jsx,tsx}','./components/**/*.{js,ts,jsx,tsx}'], theme: { extend: {} }, plugins: [] };`);
+  writeFileSync(join(projectDir, "tailwind.config.js"),
+    "module.exports={content:['./app/**/*.{js,ts,jsx,tsx}','./components/**/*.{js,ts,jsx,tsx}'],theme:{extend:{}},plugins:[]};");
 
-  // postcss.config.js
-  writeFileSync(join(tmpDir, "postcss.config.js"), `module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };`);
+  writeFileSync(join(projectDir, "postcss.config.js"),
+    "module.exports={plugins:{tailwindcss:{},autoprefixer:{}}};");
 
-  // tsconfig.json
-  writeFileSync(join(tmpDir, "tsconfig.json"), JSON.stringify({
-    compilerOptions: { target: "es5", lib: ["dom","dom.iterable","esnext"], allowJs: true, skipLibCheck: true,
-      strict: true, noEmit: true, esModuleInterop: true, module: "esnext", moduleResolution: "bundler",
-      resolveJsonModule: true, isolatedModules: true, jsx: "preserve", incremental: true,
-      plugins: [{ name: "next" }], paths: { "@/*": ["./*"] } },
-    include: ["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],
-    exclude: ["node_modules"]
+  writeFileSync(join(projectDir, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "es5", lib: ["dom", "dom.iterable", "esnext"], allowJs: true,
+      skipLibCheck: true, strict: false, noEmit: true, esModuleInterop: true,
+      module: "esnext", moduleResolution: "bundler", resolveJsonModule: true,
+      isolatedModules: true, jsx: "preserve", incremental: true,
+      baseUrl: ".", paths: { "@/*": ["./*"] }
+    },
+    include: ["next-env.d.ts", "**/*.ts", "**/*.tsx"], exclude: ["node_modules"]
   }, null, 2));
 
-  // globals.css
-  mkdirSync(join(tmpDir, "app"), { recursive: true });
-  writeFileSync(join(tmpDir, "app", "globals.css"), `@tailwind base;\n@tailwind components;\n@tailwind utilities;`);
+  writeFileSync(join(projectDir, "app", "globals.css"),
+    "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n");
 
-  // components dir
-  mkdirSync(join(tmpDir, "components"), { recursive: true });
-
-  // Escribir archivos generados por Claude
-  for (const [filePath, content] of Object.entries(projectFiles)) {
-    const fullPath = join(tmpDir, filePath);
+  // Archivos generados por Claude
+  for (const [filePath, content] of Object.entries(generatedFiles)) {
+    const fullPath = join(projectDir, filePath);
     mkdirSync(join(fullPath, ".."), { recursive: true });
     writeFileSync(fullPath, content);
     log(`Escrito: ${filePath} (${content.length} chars)`);
   }
 
-  // npm install + next build
-  log("Instalando dependencias...");
-  execSync("npm install --prefer-offline --no-audit --no-fund", { cwd: tmpDir, stdio: "pipe", timeout: 120000 });
-  log("Construyendo...");
-  execSync("npm run build", { cwd: tmpDir, stdio: "pipe", timeout: 180000, env: { ...process.env, NODE_ENV: "production" } });
-
-  const outDir = join(tmpDir, "out");
-  log(`Build completado. out/ generado.`);
-  return { outDir, tmpDir };
+  return projectDir;
 }
 
-// Sube todos los archivos del directorio out/ a Cloudflare Pages
+// ── PHASE 4 (when needed): Build + Deploy ────────────────────────────────
+
+function buildProject(projectDir) {
+  log("npm install...");
+  execSync("npm install --no-audit --no-fund", { cwd: projectDir, stdio: "pipe", timeout: 180000 });
+  log("next build...");
+  try {
+    execSync("npm run build", {
+      cwd: projectDir, stdio: "pipe", timeout: 300000,
+      env: { ...process.env, NODE_ENV: "production" }
+    });
+  } catch (e) {
+    const stderr = e.stderr?.toString() || "";
+    throw new Error("Build failed: " + stderr.slice(0, 400));
+  }
+  return join(projectDir, "out");
+}
+
+function getAllFiles(dir, base = dir) {
+  const files = [];
+  for (const f of readdirSync(dir)) {
+    const full = join(dir, f);
+    if (statSync(full).isDirectory()) files.push(...getAllFiles(full, base));
+    else files.push({ full, rel: "/" + relative(base, full).replace(/\\/g, "/") });
+  }
+  return files;
+}
+
 async function deployToCloudflare(projectName, outDir) {
-  // 1. Crear proyecto Pages
-  const r1 = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects`, {
+  await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects`, {
     method: "POST", headers: { "Authorization": `Bearer ${CF_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({ name: projectName, production_branch: "main" })
   });
-  const d1 = await r1.json();
-  if (!r1.ok && !JSON.stringify(d1).includes("8000007")) log(`Pages project warn: ${JSON.stringify(d1.errors)}`);
 
-  // 2. Recoger todos los archivos del out/
-  function getAllFiles(dir, base = dir) {
-    const files = [];
-    for (const f of readdirSync(dir)) {
-      const full = join(dir, f);
-      if (statSync(full).isDirectory()) { files.push(...getAllFiles(full, base)); }
-      else { files.push({ full, rel: "/" + relative(base, full).replace(/\\/g, "/") }); }
-    }
-    return files;
-  }
   const files = getAllFiles(outDir);
-  log(`Subiendo ${files.length} archivos a Cloudflare Pages...`);
+  log(`Subiendo ${files.length} archivos a Cloudflare...`);
 
-  // 3. Direct Upload — crear deployment
-  const form1 = new FormData();
-  form1.append("branch", "main");
-  const r2 = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects/${projectName}/deployments`, {
-    method: "POST", headers: { "Authorization": `Bearer ${CF_TOKEN}` }, body: form1
-  });
-  const d2 = await r2.json();
-
-  // 4. Upload files via bulk upload
   const manifest = {};
-  const formFiles = new FormData();
+  const form = new FormData();
   for (const { full, rel } of files) {
-    const content = readFileSync(full);
-    const hash = crypto.createHash("sha256").update(content).digest("hex");
+    const buf = readFileSync(full);
+    const hash = crypto.createHash("sha256").update(buf).digest("hex");
     manifest[rel] = hash;
-    const mimeType = rel.endsWith(".html") ? "text/html" : rel.endsWith(".css") ? "text/css" :
+    const mime = rel.endsWith(".html") ? "text/html" : rel.endsWith(".css") ? "text/css" :
       rel.endsWith(".js") ? "application/javascript" : rel.endsWith(".json") ? "application/json" :
-      rel.endsWith(".svg") ? "image/svg+xml" : "application/octet-stream";
-    formFiles.append(`files[${hash}]`, new Blob([content], { type: mimeType }), rel.slice(1));
+      "application/octet-stream";
+    form.append(`files[${hash}]`, new Blob([buf], { type: mime }), rel.slice(1));
   }
-  formFiles.append("manifest", JSON.stringify(manifest));
+  form.append("manifest", JSON.stringify(manifest));
 
-  const r3 = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects/${projectName}/deployments`, {
-    method: "POST", headers: { "Authorization": `Bearer ${CF_TOKEN}` }, body: formFiles
-  });
-  const d3 = await r3.json();
-  if (!r3.ok) throw new Error("Deploy failed: " + JSON.stringify(d3.errors));
-
-  const url = d3.result?.url || `https://${projectName}.pages.dev`;
-  log(`Desplegado: ${url}`);
-  return url;
+  const r = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects/${projectName}/deployments`,
+    { method: "POST", headers: { "Authorization": `Bearer ${CF_TOKEN}` }, body: form }
+  );
+  const d = await r.json();
+  if (!r.ok) throw new Error("Deploy failed: " + JSON.stringify(d.errors));
+  return d.result?.url || `https://${projectName}.pages.dev`;
 }
+
+// ── TASK ROUTING ─────────────────────────────────────────────────────────
+
+async function handleTask(task) {
+  const type = task.task_type || task.input_json?.task_type || "";
+  const input = task.input_json || {};
+  const brief = task.input_prompt || input.prompt || input.brief || "";
+  const chatId = input.chat_id || CHAT;
+  const workOrderId = task.work_order_id;
+
+  // Tareas de relleno (Phase 2 graph — las ejecutamos como no-op para avanzar el grafo)
+  const PASSTHROUGH = ["collect_website_assets","generate_website_brief",
+    "generate_website_structure","generate_homepage_copy","generate_seo_metadata","process_images"];
+  if (PASSTHROUGH.includes(type)) {
+    log(`Pasando: ${type}`);
+    await supabase.from("agent_tasks").update({
+      status: "done", output_json: { skipped: false, phase: "passthrough", task_type: type },
+      completed_at: new Date().toISOString()
+    }).eq("id", task.id);
+    return true;
+  }
+
+  // ── PHASE 3: Generar archivos Next.js reales ──
+  if (type === "assemble_nextjs_project" || type === "web_generate") {
+    const photoUrls = input.photo_urls || [];
+    const projectSlug = ("horizon-" + Date.now().toString(36)).toLowerCase();
+
+    log(`Generando proyecto Next.js: ${projectSlug}`);
+    const generated = await generateNextJsFiles(brief, photoUrls, projectSlug);
+    log(`Archivos Claude: ${Object.keys(generated.files).join(", ")}`);
+
+    const projectDir = writeProjectFiles(projectSlug, generated.files);
+    const fileList = Object.keys(generated.files);
+    log(`Proyecto escrito en: ${projectDir}`);
+
+    // Guardar en BD — output_json con ruta y archivos
+    await supabase.from("agent_tasks").update({
+      status: "done",
+      output_json: {
+        project_slug: projectSlug,
+        project_dir: projectDir,
+        project_title: generated.project_title || "",
+        description: generated.description || "",
+        files_generated: fileList,
+        file_count: fileList.length,
+        ready_for_build: true
+      },
+      completed_at: new Date().toISOString()
+    }).eq("id", task.id);
+
+    // Guardar también en work_order metadata
+    await supabase.from("work_orders").update({
+      metadata: { ...(await getWoMetadata(workOrderId)), project_slug: projectSlug, project_dir: projectDir, files_generated: fileList },
+      updated_at: new Date().toISOString()
+    }).eq("id", workOrderId);
+
+    // Evento en agent_events
+    await supabase.from("agent_events").insert({
+      work_order_id: workOrderId, actor: "web-worker",
+      event_type: "nextjs_files_generated",
+      message: `Proyecto ${projectSlug} generado. ${fileList.length} archivos: ${fileList.join(", ")}`,
+      payload_json: { project_slug: projectSlug, project_dir: projectDir, files: fileList },
+      created_at: new Date().toISOString()
+    });
+
+    log(`Phase 3 completa: ${projectSlug}`);
+    return true;
+  }
+
+  // ── PHASE 4: Deploy preview ──
+  if (type === "deploy_preview") {
+    // Buscar la tarea assemble_nextjs_project completada de este work_order
+    const { data: assembleTasks } = await supabase.from("agent_tasks")
+      .select("output_json").eq("work_order_id", workOrderId)
+      .eq("task_type", "assemble_nextjs_project").eq("status", "done").limit(1);
+
+    const assembleOutput = assembleTasks?.[0]?.output_json;
+    if (!assembleOutput?.project_dir) {
+      throw new Error("No se encontro proyecto generado para deployar");
+    }
+
+    const { project_dir, project_slug } = assembleOutput;
+    log(`Building ${project_slug}...`);
+    const outDir = buildProject(project_dir);
+    const url = await deployToCloudflare(project_slug, outDir);
+
+    await supabase.from("agent_tasks").update({
+      status: "done",
+      output_json: { url, project_slug },
+      completed_at: new Date().toISOString()
+    }).eq("id", task.id);
+
+    await supabase.from("work_orders").update({
+      metadata: { ...(await getWoMetadata(workOrderId)), preview_url: url },
+      status: "in_progress", updated_at: new Date().toISOString()
+    }).eq("id", workOrderId);
+
+    log(`Deploy completo: ${url}`);
+    return true;
+  }
+
+  // ── Notify Telegram ──
+  if (type === "notify_telegram") {
+    const { data: deployTasks } = await supabase.from("agent_tasks")
+      .select("output_json").eq("work_order_id", workOrderId)
+      .eq("task_type", "deploy_preview").eq("status", "done").limit(1);
+
+    const url = deployTasks?.[0]?.output_json?.url;
+    if (url) {
+      await tg(`Aqui tienes la web:\n\n${url}`, chatId);
+      await supabase.from("work_orders").update({
+        status: "completed", updated_at: new Date().toISOString()
+      }).eq("id", workOrderId);
+    }
+
+    await supabase.from("agent_tasks").update({
+      status: "done", output_json: { notified: !!url, url: url || null },
+      completed_at: new Date().toISOString()
+    }).eq("id", task.id);
+    return true;
+  }
+
+  // Tipo desconocido — skip
+  log(`Tipo desconocido: ${type} — skip`);
+  await supabase.from("agent_tasks").update({
+    status: "done", output_json: { skipped: true, reason: "unknown_type" },
+    completed_at: new Date().toISOString()
+  }).eq("id", task.id);
+  return true;
+}
+
+async function getWoMetadata(workOrderId) {
+  const { data } = await supabase.from("work_orders").select("metadata").eq("id", workOrderId).single();
+  return data?.metadata || {};
+}
+
+// ── CLAIM + LOOP ──────────────────────────────────────────────────────────
 
 async function claimTask() {
   try {
     const { data: tasks } = await supabase.from("agent_tasks").select("*")
-      .eq("status", "pending").order("sequence_order", { ascending: true }).limit(20);
+      .eq("status", "pending").order("sequence_order", { ascending: true }).limit(30);
     if (!tasks?.length) return null;
+
     for (const task of tasks) {
-      const execType = task.input_json?.execution_type || task.input_json?.task_type || task.task_type || "";
-      const isWebTask = MY_TYPES.some(t => execType.includes(t)) || MY_ROLES.includes(task.agent_role);
-      if (!isWebTask) continue;
+      const type = task.task_type || task.input_json?.task_type || "";
+      if (!HANDLED_TYPES.includes(type) && type !== "web_generate") continue;
+
+      // Verificar dependencias por sequence_order
       if (task.depends_on?.length) {
-        const { data: deps } = await supabase.from("agent_tasks").select("id,status").in("id", task.depends_on);
-        if (!deps?.every(d => d.status === "done" || d.status === "skipped")) continue;
+        const depSeqs = task.depends_on;
+        const { data: siblings } = await supabase.from("agent_tasks")
+          .select("sequence_order,status")
+          .eq("work_order_id", task.work_order_id)
+          .lt("sequence_order", task.sequence_order);
+        const allDone = depSeqs.every(seq =>
+          siblings?.find(s => s.sequence_order === seq && (s.status === "done" || s.status === "skipped"))
+        );
+        if (!allDone) continue;
       }
+
       const { data: claimed, error } = await supabase.from("agent_tasks")
         .update({ status: "running", started_at: new Date().toISOString() })
         .eq("id", task.id).eq("status", "pending").select().single();
@@ -222,63 +367,36 @@ async function claimTask() {
   } catch (e) { log("claimTask: " + e.message); return null; }
 }
 
-async function completeTask(taskId, woId, success, url, error) {
-  await supabase.from("agent_tasks").update({
-    status: success ? "done" : "failed",
-    output_json: { url: url || null, worker: "web-worker", framework: "nextjs" },
-    error_message: error || null, completed_at: new Date().toISOString()
-  }).eq("id", taskId);
-  await supabase.from("agent_events").insert({
-    work_order_id: woId, agent_name: "web-worker",
-    event_type: success ? "web_deployed" : "web_failed",
-    message: success ? `Next.js web publicada: ${url}` : `Error: ${error}`,
-    payload_json: { url, framework: "nextjs" }
-  });
-  try { await supabase.rpc("update_work_order_progress", { p_work_order_id: woId }); } catch {}
-}
-
 async function processTask() {
   const task = await claimTask();
   if (!task) return false;
   const chatId = task.input_json?.chat_id || task.input_json?.telegram_chat_id || CHAT;
-  log(`Procesando: ${task.title}`);
-
-  const projectName = ("horizon-" + Date.now().toString(36)).toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
-  let tmpDir = null;
-
+  log(`Procesando [${task.task_type}]: ${task.title}`);
   try {
-    // 1. Generar archivos Next.js con Claude
-    const result = await generateNextJsProject(task);
-    log(`Archivos generados: ${Object.keys(result.files).join(", ")}`);
-
-    // 2. Build
-    const built = await buildNextProject(result.files, projectName);
-    tmpDir = built.tmpDir;
-
-    // 3. Deploy
-    const url = await deployToCloudflare(projectName, built.outDir);
-
-    // 4. Guardar + notificar
-    await completeTask(task.id, task.work_order_id, true, url, null);
-    await supabase.from("work_orders").update({ status: "completed", updated_at: new Date().toISOString() }).eq("id", task.work_order_id);
-    await tg(`Aqui tienes la web:\n\n${url}`, chatId);
-    log(`Completado: ${url}`);
+    await handleTask(task);
   } catch (err) {
-    log("Error: " + err.message);
-    await completeTask(task.id, task.work_order_id, false, null, err.message.slice(0, 300));
-    await tg(`Algo fallo generando la web. Error: ${err.message.slice(0, 150)}`, chatId);
-  } finally {
-    if (tmpDir) { try { rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
+    log(`Error en ${task.task_type}: ${err.message}`);
+    await supabase.from("agent_tasks").update({
+      status: "failed", error_message: err.message.slice(0, 300),
+      completed_at: new Date().toISOString()
+    }).eq("id", task.id);
+    await tg(`Error en ${task.task_type}: ${err.message.slice(0, 120)}`, chatId);
   }
   return true;
 }
 
 async function heartbeat() {
-  try { await supabase.from("worker_health").upsert({ worker_name: "horizon-web-worker", status: "online", heartbeat_at: new Date().toISOString() }, { onConflict: "worker_name" }); } catch {}
+  try {
+    await supabase.from("worker_health").upsert({
+      worker_name: "horizon-web-worker", status: "online",
+      heartbeat_at: new Date().toISOString()
+    }, { onConflict: "worker_name" });
+  } catch {}
 }
 
 async function main() {
-  log("Horizon Web Worker (Next.js) activo");
+  mkdirSync(SITES_DIR, { recursive: true });
+  log(`Horizon Web Worker (Phase 3) — sites dir: ${SITES_DIR}`);
   await heartbeat();
   setInterval(heartbeat, 60000);
   while (true) {
