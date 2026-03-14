@@ -224,6 +224,16 @@ async function handleTask(task) {
     const photoUrls = input.photo_urls || [];
     const projectSlug = ("horizon-" + Date.now().toString(36)).toLowerCase();
 
+    // ── PHASE 5: Milestone 3 — Generación iniciada ──
+    await tg("Generando tu web ahora con Next.js + Tailwind. Esto tarda unos minutos, te aviso cuando este lista.", chatId);
+    await supabase.from("agent_events").insert({
+      work_order_id: workOrderId, actor: "web-worker",
+      event_type: "telegram_notification_sent",
+      message: "Generando tu web ahora...",
+      payload_json: { milestone: "generation_started", chat_id: chatId },
+      created_at: new Date().toISOString()
+    });
+
     log(`Generando proyecto Next.js: ${projectSlug}`);
     const generated = await generateNextJsFiles(brief, photoUrls, projectSlug);
     log(`Archivos Claude: ${Object.keys(generated.files).join(", ")}`);
@@ -313,20 +323,24 @@ async function handleTask(task) {
     try {
       outDir = buildProject(project_dir);
     } catch (buildErr) {
-      await supabase.from("agent_events").insert({
-        work_order_id: workOrderId, actor: "web-worker",
-        event_type: "deploy_failed",
-        message: "Build fallido: " + buildErr.message.slice(0, 200),
-        payload_json: { project_slug, error: buildErr.message.slice(0, 300) },
-        created_at: new Date().toISOString()
-      });
-      await supabase.from("agent_tasks").update({
-        status: "failed", error_message: buildErr.message.slice(0, 300),
-        output_json: { project_slug, build_failed: true },
-        completed_at: new Date().toISOString()
-      }).eq("id", task.id);
-      throw buildErr;
-    }
+      const errMsg = "El build de la web ha fallado. Reintentando en la proxima ejecucion.";
+      await supabase.from("agent_events").insert([
+        {
+          work_order_id: workOrderId, actor: "web-worker",
+          event_type: "deploy_failed",
+          message: "Build fallido: " + buildErr.message.slice(0, 200),
+          payload_json: { project_slug, error: buildErr.message.slice(0, 300) },
+          created_at: new Date().toISOString()
+        },
+        {
+          work_order_id: workOrderId, actor: "web-worker",
+          event_type: "telegram_notification_sent",
+          message: errMsg,
+          payload_json: { milestone: "deploy_failed", error: buildErr.message.slice(0, 100) },
+          created_at: new Date().toISOString()
+        }
+      ]);
+      await tg(errMsg, chatId);
 
     // 5. Deploy a Cloudflare
     let url;
@@ -406,18 +420,21 @@ async function handleTask(task) {
     const now = new Date().toISOString();
 
     if (url && url.startsWith("http")) {
-      await tg(`Tu web esta lista:\n\n${url}`, chatId);
+      // ── PHASE 5: Milestone 4 — Preview lista ──
+      const msg = `Tu web esta lista:\n\n${url}\n\nEs una preview — puedes revisarla y pedirme cambios.`;
+      await tg(msg, chatId);
       await supabase.from("work_orders").update({
         status: "completed", updated_at: now
       }).eq("id", workOrderId);
       await supabase.from("agent_events").insert({
         work_order_id: workOrderId, actor: "web-worker",
-        event_type: "website_completed",
-        message: `Web entregada al cliente: ${url}`,
-        payload_json: { url }, created_at: now
+        event_type: "telegram_notification_sent",
+        message: msg,
+        payload_json: { milestone: "preview_ready", url, chat_id: chatId },
+        created_at: now
       });
     } else {
-      await tg("La web se genero pero no hay URL de preview disponible aun.", chatId);
+      await tg("La web se genero pero no hay URL de preview disponible aun. Revisalo en unos minutos.", chatId);
     }
 
     await supabase.from("agent_tasks").update({
