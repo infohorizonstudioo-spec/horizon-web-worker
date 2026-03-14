@@ -91,8 +91,9 @@ async function generateWebsite(task) {
       `Devuelve SOLO el HTML completo empezando con <!DOCTYPE html>. Sin explicaciones.`
     }]
   });
-  const html = msg.content.filter(b => b.type === "text").map(b => b.text).join("").trim();
-  if (!html.includes("<!DOCTYPE") && !html.includes("<html")) throw new Error("HTML inválido");
+  const html = msg.content.filter(b => b.type === "text").map(b => b.text).join("").trim()
+    .replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+  if (!html.includes("<!DOCTYPE") && !html.includes("<html")) throw new Error("HTML invalido: " + html.slice(0, 100));
   return html;
 }
 
