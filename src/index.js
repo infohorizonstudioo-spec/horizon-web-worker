@@ -268,31 +268,129 @@ async function handleTask(task) {
 
   // ── PHASE 4: Deploy preview ──
   if (type === "deploy_preview") {
-    // Buscar la tarea assemble_nextjs_project completada de este work_order
+    const now = new Date().toISOString();
+
+    // 1. Buscar proyecto generado en Phase 3
     const { data: assembleTasks } = await supabase.from("agent_tasks")
       .select("output_json").eq("work_order_id", workOrderId)
-      .eq("task_type", "assemble_nextjs_project").eq("status", "done").limit(1);
-
+      .in("task_type", ["assemble_nextjs_project","web_generate"]).eq("status","done").limit(1);
     const assembleOutput = assembleTasks?.[0]?.output_json;
+
     if (!assembleOutput?.project_dir) {
+      await supabase.from("agent_events").insert({
+        work_order_id: workOrderId, actor: "web-worker",
+        event_type: "deploy_failed",
+        message: "No se encontro proyecto generado. Ejecuta primero assemble_nextjs_project.",
+        payload_json: { reason: "no_project_dir" }, created_at: now
+      });
       throw new Error("No se encontro proyecto generado para deployar");
     }
 
     const { project_dir, project_slug } = assembleOutput;
-    log(`Building ${project_slug}...`);
-    const outDir = buildProject(project_dir);
-    const url = await deployToCloudflare(project_slug, outDir);
 
+    // 2. Validar que los archivos existen en disco
+    if (!existsSync(join(project_dir, "app", "page.tsx"))) {
+      await supabase.from("agent_events").insert({
+        work_order_id: workOrderId, actor: "web-worker",
+        event_type: "deploy_failed",
+        message: `Archivos no encontrados en disco: ${project_dir}`,
+        payload_json: { project_dir, project_slug }, created_at: now
+      });
+      throw new Error("Archivos del proyecto no existen en disco: " + project_dir);
+    }
+
+    // 3. Evento: deploy_started
+    await supabase.from("agent_events").insert({
+      work_order_id: workOrderId, actor: "web-worker",
+      event_type: "deploy_started",
+      message: `Iniciando build y deploy de ${project_slug}`,
+      payload_json: { project_dir, project_slug }, created_at: now
+    });
+    log(`Iniciando deploy: ${project_slug}`);
+
+    // 4. Build
+    let outDir;
+    try {
+      outDir = buildProject(project_dir);
+    } catch (buildErr) {
+      await supabase.from("agent_events").insert({
+        work_order_id: workOrderId, actor: "web-worker",
+        event_type: "deploy_failed",
+        message: "Build fallido: " + buildErr.message.slice(0, 200),
+        payload_json: { project_slug, error: buildErr.message.slice(0, 300) },
+        created_at: new Date().toISOString()
+      });
+      await supabase.from("agent_tasks").update({
+        status: "failed", error_message: buildErr.message.slice(0, 300),
+        output_json: { project_slug, build_failed: true },
+        completed_at: new Date().toISOString()
+      }).eq("id", task.id);
+      throw buildErr;
+    }
+
+    // 5. Deploy a Cloudflare
+    let url;
+    try {
+      url = await deployToCloudflare(project_slug, outDir);
+    } catch (deployErr) {
+      await supabase.from("agent_events").insert({
+        work_order_id: workOrderId, actor: "web-worker",
+        event_type: "deploy_failed",
+        message: "Deploy a Cloudflare fallido: " + deployErr.message.slice(0, 200),
+        payload_json: { project_slug, error: deployErr.message.slice(0, 300) },
+        created_at: new Date().toISOString()
+      });
+      await supabase.from("agent_tasks").update({
+        status: "failed", error_message: deployErr.message.slice(0, 300),
+        output_json: { project_slug, deploy_failed: true },
+        completed_at: new Date().toISOString()
+      }).eq("id", task.id);
+      throw deployErr;
+    }
+
+    // 6. Validar URL real antes de guardarla
+    if (!url || !url.startsWith("http")) {
+      const err = "URL de deploy invalida: " + String(url).slice(0, 100);
+      await supabase.from("agent_events").insert({
+        work_order_id: workOrderId, actor: "web-worker",
+        event_type: "deploy_failed", message: err,
+        payload_json: { project_slug, url }, created_at: new Date().toISOString()
+      });
+      throw new Error(err);
+    }
+
+    // 7. Guardar URL real en BD
+    const completedAt = new Date().toISOString();
     await supabase.from("agent_tasks").update({
       status: "done",
-      output_json: { url, project_slug },
-      completed_at: new Date().toISOString()
+      output_json: { url, project_slug, deployed_at: completedAt },
+      completed_at: completedAt
     }).eq("id", task.id);
 
+    // Guardar en work_orders metadata
+    const woMeta = await getWoMetadata(workOrderId);
     await supabase.from("work_orders").update({
-      metadata: { ...(await getWoMetadata(workOrderId)), preview_url: url },
-      status: "in_progress", updated_at: new Date().toISOString()
+      metadata: { ...woMeta, preview_url: url, project_slug, deployed_at: completedAt },
+      status: "in_progress", updated_at: completedAt
     }).eq("id", workOrderId);
+
+    // Guardar en website_projects si existe (buscar por work_order_id)
+    const { data: wp } = await supabase.from("website_projects")
+      .select("id").eq("work_order_id", workOrderId).limit(1);
+    if (wp?.[0]?.id) {
+      await supabase.from("website_projects").update({
+        preview_url: url, status: "deployed", updated_at: completedAt
+      }).eq("id", wp[0].id);
+    }
+
+    // 8. Evento: deploy_succeeded
+    await supabase.from("agent_events").insert({
+      work_order_id: workOrderId, actor: "web-worker",
+      event_type: "deploy_succeeded",
+      message: `Preview publicada: ${url}`,
+      payload_json: { url, project_slug, deployed_at: completedAt },
+      created_at: completedAt
+    });
 
     log(`Deploy completo: ${url}`);
     return true;
@@ -305,16 +403,26 @@ async function handleTask(task) {
       .eq("task_type", "deploy_preview").eq("status", "done").limit(1);
 
     const url = deployTasks?.[0]?.output_json?.url;
-    if (url) {
-      await tg(`Aqui tienes la web:\n\n${url}`, chatId);
+    const now = new Date().toISOString();
+
+    if (url && url.startsWith("http")) {
+      await tg(`Tu web esta lista:\n\n${url}`, chatId);
       await supabase.from("work_orders").update({
-        status: "completed", updated_at: new Date().toISOString()
+        status: "completed", updated_at: now
       }).eq("id", workOrderId);
+      await supabase.from("agent_events").insert({
+        work_order_id: workOrderId, actor: "web-worker",
+        event_type: "website_completed",
+        message: `Web entregada al cliente: ${url}`,
+        payload_json: { url }, created_at: now
+      });
+    } else {
+      await tg("La web se genero pero no hay URL de preview disponible aun.", chatId);
     }
 
     await supabase.from("agent_tasks").update({
       status: "done", output_json: { notified: !!url, url: url || null },
-      completed_at: new Date().toISOString()
+      completed_at: now
     }).eq("id", task.id);
     return true;
   }
@@ -396,7 +504,7 @@ async function heartbeat() {
 
 async function main() {
   mkdirSync(SITES_DIR, { recursive: true });
-  log(`Horizon Web Worker (Phase 3) — sites dir: ${SITES_DIR}`);
+  log(`Horizon Web Worker (Phases 3+4) — sites dir: ${SITES_DIR}`);
   await heartbeat();
   setInterval(heartbeat, 60000);
   while (true) {
